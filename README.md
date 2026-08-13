@@ -12,11 +12,12 @@ You log in yourself, in a real browser window. Nothing here bypasses authenticat
 
 - Walks the **Photos** and **Videos** tabs of the gallery week by week, back to a target date
 - Grabs the **full-size original** of every item (not the gallery thumbnail)
-- Saves everything **flat** into `procare_media/` as `YYYYMMDD_<contenthash>.jpg` / `.mp4`
+- Saves everything **flat** into a folder you choose as `YYYYMMDD_<contenthash>.jpg` / `.mp4`
 - **Never duplicates**: filenames are a hash of the file's contents
 - **Resumable**: interrupt with Ctrl-C any time and re-run; it picks up where it stopped
 - **Logs in once**: the browser session is saved and reused on later runs
-- Writes `procare_manifest.csv` listing every file with its date, week, and source URL
+- Writes `procare_manifest.csv` (inside the download folder) listing every file with its date, week, and source URL
+- Prints the **full download path** before starting and again when finished
 
 ---
 
@@ -71,36 +72,53 @@ Confirm it prints `REACHED TARGET` and `0 gaps` before committing to a long run.
 ### 2. Download everything
 
 ```bash
-python procare_download.py --target-date 2025-07-01 --workers 3 --dl-threads 12
+python procare_download.py --target-date 2025-07-01
 ```
 
-Photos land in `procare_media/`. Re-run the same command any time to pick up newly posted photos — existing files are skipped.
+The full path being written to is printed **before** downloading starts and again **when it finishes**, so there's never any doubt where the files went.
+
+Re-run the same command any time to pick up newly posted photos — existing files are skipped.
+
+### Choosing where files go
+
+By default everything lands in `./procare_media`. Point it anywhere with `-o`:
+
+```bash
+python procare_download.py -o ~/Pictures/Daycare
+```
+
+The folder is created if it doesn't exist, `~` is expanded, and the manifest and resume state live inside it — so a folder is fully self-describing and can be moved or backed up as a unit.
 
 ### Options
 
 | Flag | Meaning |
 |---|---|
+| `-o, --out DIR` | Download folder (default `./procare_media`) |
 | `--target-date YYYY-MM-DD` | How far back to go (default `2025-08-18`) |
 | `--nav-test` | Verify the date range is reachable; download nothing |
-| `--workers N` | Split the photo date range across N parallel browsers (default 1) |
-| `--dl-threads M` | Parallel download threads (default 8) |
+| `-w, --workers N` | Browsers splitting the photo date range (default 2) |
+| `-d, --dl-threads M` | Parallel download threads (default 12) |
 | `--photos-only` / `--videos-only` | Restrict to one tab |
 | `--show` | Show the browser windows instead of running hidden |
 | `--relogin` | Ignore the saved session and log in again |
 
-Start with `--workers 3 --dl-threads 12`. More workers means more browsers, so more RAM and CPU; past ~4 you're mostly adding load, not speed.
+The defaults are tuned for a normal laptop. More workers means more browsers, so more RAM and CPU; past ~4 you're mostly adding load, not speed.
 
 ---
 
 ## How it works
 
-Two stages that run at the same time and never block each other:
+Three pieces, none of which waits on anything it doesn't have to:
 
-**Browsers** walk the gallery week by week. Most full-size URLs come straight out of the gallery's own JSON API responses, so no photo viewer needs to be opened at all. Tiles the JSON doesn't cover fall back to clicking the tile and reading the download link from the viewer.
+**Gallery** drives one browser tab. Changing week is *network*-driven: it waits for the gallery's own JSON payload rather than polling the DOM for tiles to settle, and it reads the items straight out of that payload. The photo viewer is never opened in the normal path.
 
-**Downloaders** pull those URLs off a queue and fetch them over plain HTTP. The CDN links are CloudFront *signed URLs* — the signature is in the query string — so they authenticate themselves and can be fetched in parallel without a browser.
+**Walker** steps back week by week, turns payloads into items, and pushes them onto a queue. Only items the JSON doesn't explain fall back to clicking a tile and reading the viewer's download link.
+
+**Download pool** fetches over plain HTTP. The CDN links are CloudFront *signed URLs* — the signature is in the query string — so they need neither browser nor cookies and parallelise freely.
 
 Dates come from the item's own timestamp in the API when available, then from a date embedded in the CDN filename, and failing both, the Monday of the week it appeared in.
+
+De-duplication is by **content hash**, and resume state is keyed by the URL path (never the query string, since the CloudFront signature changes on every page load).
 
 ---
 
@@ -110,7 +128,7 @@ The first run opens a browser window for you to log in manually — this handles
 
 Afterwards, the browser session is written to **`procare_session.json`** (mode `600`) and reused, so you don't retype anything. **Your email and password are never stored or seen by the script** — only the session cookie Procare itself issued, the same thing a "stay signed in" checkbox saves. Delete the file (or pass `--relogin`) to sign out.
 
-`.gitignore` excludes `procare_session.json`, `procare_media/`, and the manifest, so **your session and your child's photos can never be committed**. Keep it that way if you fork this.
+`.gitignore` excludes `procare_session.json` and every media folder and file type, so **your session and your child's photos can never be committed**. Keep it that way if you fork this.
 
 ---
 
@@ -118,7 +136,7 @@ Afterwards, the browser session is written to **`procare_session.json`** (mode `
 
 **"Could not determine the gallery id"** — open Photos/Videos in the browser window manually, then re-run.
 
-**It stops before the target date** — run `--nav-test` to see where. The week pager stops when the date label doesn't change, which usually means the page was still loading; the timeouts near the top of the script (`WEEK_LOAD_TIMEOUT`) can be raised.
+**It stops before the target date** — run `--nav-test` to see where. The week pager stops when the date label doesn't change, which usually means the page was still loading; the timeouts near the top of the script (`WEEK_TIMEOUT`) can be raised.
 
 **Lots of `miss` in the summary** — the viewer fallback is failing. Run with `--show` to watch, and check whether the modal opens on click.
 
