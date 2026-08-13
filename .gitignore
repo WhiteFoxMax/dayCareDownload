@@ -1,0 +1,45 @@
+# ---------------------------------------------------------------------------
+# NEVER COMMIT THESE
+# ---------------------------------------------------------------------------
+# Live Procare session tokens — anyone with this file can access the account.
+procare_session.json
+*_session.json
+
+# Downloaded media — photos and videos of a child. Keep them off the internet.
+# Broad patterns on purpose: it must be impossible to commit these by accident.
+procare_media*/
+procare_photos*/
+procare_videos*/
+test_downloads*/
+*.jpg
+*.jpeg
+*.png
+*.gif
+*.webp
+*.heic
+*.mp4
+*.mov
+*.m4v
+*.webm
+
+# Run state and logs, which contain media URLs and identifiers.
+.progress_*.json
+procare_manifest.csv
+discovered_urls.txt
+failed_urls.txt
+
+# ---------------------------------------------------------------------------
+# Environment / build noise
+# ---------------------------------------------------------------------------
+venv/
+.venv/
+env/
+__pycache__/
+*.py[cod]
+*.egg-info/
+
+# macOS / editors
+.DS_Store
+.idea/
+.vscode/
+*.swp
