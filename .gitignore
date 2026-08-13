@@ -11,6 +11,9 @@ procare_media*/
 procare_photos*/
 procare_videos*/
 test_downloads*/
+postrefactor*/
+# Any folder holding a download manifest is a download folder — ignore it all.
+**/procare_manifest.csv
 *.jpg
 *.jpeg
 *.png
