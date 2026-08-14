@@ -20,6 +20,8 @@ You log in yourself, in a real browser window. Nothing here bypasses authenticat
 - **Resumable**: interrupt with Ctrl-C any time and re-run; it picks up where it stopped
 - **Logs in once**: the browser session is saved and reused on later runs
 - Writes `procare_manifest.csv` (inside the download folder) listing every file with its date, week, and source URL
+- Stamps each file's **created and modified dates** with the day it was taken, so
+  they sort chronologically in Finder and import into Photos correctly
 - Prints the **full download path** before starting and again when finished
 
 ---
@@ -127,9 +129,18 @@ python procare_download.py -o <folder> --rename-existing   # add child names, th
 python procare_download.py -o <folder> --organize          # file existing names into folders
 ```
 
-`--rename-existing` rebuilds the file-to-child map from the API; `--organize`
-works from the filenames alone. Both update the manifest, and files whose child
-can't be determined are left untouched rather than guessed at.
+```bash
+python procare_download.py -o <folder> --fix-dates           # stamp file dates
+```
+
+`--rename-existing` rebuilds the file-to-child map from the API, then files and
+stamps everything; `--organize` and `--fix-dates` work from the filenames alone.
+Files whose child can't be determined are left untouched rather than guessed at.
+
+File dates are set to **noon** on the day the photo was taken — midnight can roll
+onto the previous day under a timezone shift. On macOS the *created* date is set
+too (via `SetFile`, from the Xcode command line tools); elsewhere only the
+modified date is, since nothing portable can set creation time.
 
 ### Choosing where files go
 
@@ -154,6 +165,7 @@ The folder is created if it doesn't exist, `~` is expanded, and the manifest and
 | `--kid ID` | Limit to one child (id prefix); default is all children |
 | `--rename-existing` | Add child names to older downloads, then file them into folders |
 | `--organize` | Move existing files into a folder per child (offline) |
+| `--fix-dates` | Stamp existing files' dates from the date in their names (offline) |
 | `--photos-only` / `--videos-only` | Restrict the gallery to one tab |
 | `--show` | Show the browser windows instead of running hidden |
 | `--relogin` | Ignore the saved session and log in again |

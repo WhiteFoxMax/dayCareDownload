@@ -35,6 +35,8 @@ import json
 import os
 import queue
 import re
+import shutil
+import subprocess
 import sys
 import threading
 import time
@@ -94,6 +96,34 @@ PRINT_LOCK = threading.Lock()
 def log(who: str, msg: str) -> None:
     with PRINT_LOCK:
         print(f"[{who:<9}] {msg}", flush=True)
+
+
+# macOS ships SetFile with the command line tools; it is the only way to set a
+# file's *creation* date, which is what Finder sorts by. os.utime handles the
+# modified date everywhere.
+SETFILE = shutil.which("SetFile") or (
+    "/usr/bin/SetFile" if os.path.exists("/usr/bin/SetFile") else None)
+
+
+def apply_file_date(path: str, when: dt.date) -> None:
+    """
+    Stamp a file with the day it was taken, so it sorts correctly in Finder,
+    Photos and anything else that reads file times.
+
+    Noon is used rather than midnight so a timezone shift can't roll the file
+    onto the previous or next day.
+    """
+    try:
+        stamp = dt.datetime(when.year, when.month, when.day, 12, 0, 0).timestamp()
+        os.utime(path, (stamp, stamp))
+    except OSError:
+        return
+    if SETFILE:
+        try:
+            subprocess.run([SETFILE, "-d", when.strftime("%m/%d/%Y 12:00:00"), path],
+                           check=False, capture_output=True, timeout=20)
+        except Exception:
+            pass
 
 
 def human_size(n: int) -> str:
@@ -404,6 +434,7 @@ class Store:
         with open(tmp, "wb") as fh:
             fh.write(data)
         os.replace(tmp, path)
+        apply_file_date(path, item.when)
         with self._lock:
             self._rows.append((rel, item.when.isoformat(), item.week, item.url))
         return rel, "saved"
@@ -1291,6 +1322,57 @@ def ensure_session(force_relogin: bool = False) -> Auth:
 # --------------------------------------------------------------------------- #
 # CLI
 # --------------------------------------------------------------------------- #
+def fix_file_dates(store: Store) -> None:
+    """
+    Set every existing file's dates from the YYYYMMDD in its name.
+
+    SetFile calls are batched by date — one subprocess per distinct day instead
+    of per file, which turns minutes into seconds.
+    """
+    by_date: dict[dt.date, list[str]] = {}
+    skipped = 0
+    for sub, _dirs, files in os.walk(store.dir):
+        for name in files:
+            if name.startswith(".") or name == MANIFEST_NAME:
+                continue
+            m = re.match(r"(\d{4})(\d{2})(\d{2})_", name)
+            if not m:
+                skipped += 1
+                continue
+            try:
+                when = dt.date(int(m.group(1)), int(m.group(2)), int(m.group(3)))
+            except ValueError:
+                skipped += 1
+                continue
+            by_date.setdefault(when, []).append(os.path.join(sub, name))
+
+    total = sum(len(v) for v in by_date.values())
+    print(f"\n  Stamping {total} file(s) across {len(by_date)} day(s)"
+          f"{' (SetFile found: created dates too)' if SETFILE else ''}...")
+
+    done = 0
+    for when, paths in sorted(by_date.items()):
+        stamp = dt.datetime(when.year, when.month, when.day, 12, 0, 0).timestamp()
+        for path in paths:
+            try:
+                os.utime(path, (stamp, stamp))
+            except OSError:
+                pass
+        if SETFILE:
+            arg = when.strftime("%m/%d/%Y 12:00:00")
+            for i in range(0, len(paths), 200):        # keep the argv sane
+                try:
+                    subprocess.run([SETFILE, "-d", arg] + paths[i:i + 200],
+                                   check=False, capture_output=True, timeout=120)
+                except Exception:
+                    pass
+        done += len(paths)
+        if done % 400 < len(paths):
+            print(f"    {done}/{total}")
+
+    print(f"  stamped {total} file(s); {skipped} had no date in the name")
+
+
 def organize_into_folders(store: Store) -> None:
     """
     Move already-downloaded files into a folder per child.
@@ -1469,6 +1551,9 @@ def main() -> None:
     ap.add_argument("--kid", metavar="ID",
                     help="Limit to one child (id prefix). Default: all children "
                          "on the account.")
+    ap.add_argument("--fix-dates", action="store_true",
+                    help="Set existing files' created/modified dates from the "
+                         "date in their names. Downloads nothing.")
     ap.add_argument("--organize", action="store_true",
                     help="Move already-downloaded files into a folder per "
                          "child. Uses the filenames only; downloads nothing.")
@@ -1537,6 +1622,12 @@ def main() -> None:
 
     t0 = time.time()
 
+    # ------------------------- date stamping only ------------------------- #
+    if args.fix_dates:
+        fix_file_dates(store)
+        print(f"\n  FILES ARE IN     : {store.dir}")
+        return
+
     # ------------------------- organize only ------------------------- #
     if args.organize:
         organize_into_folders(store)
@@ -1552,6 +1643,7 @@ def main() -> None:
             sys.exit(1)
         rename_with_children(store, api, auth.kids, target)
         organize_into_folders(store)
+        fix_file_dates(store)
         count, size = store.summary()
         print(f"\n  Folder now holds : {count} file(s), {human_size(size)}")
         print(f"  FILES ARE IN     : {store.dir}")
