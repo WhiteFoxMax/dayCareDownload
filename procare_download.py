@@ -21,8 +21,9 @@ Three decoupled pieces, so nothing waits on anything it doesn't have to:
 Login happens once; the session is saved and reused. The password is never
 stored — only the session Procare itself issued.
 
-Output: flat files named  YYYYMMDD_<child>_<contenthash>.<ext>  so they sort by
-date, say who they are of, and never duplicate across runs. Plus a CSV manifest.
+Output: one folder per child, holding  YYYYMMDD_<child>_<contenthash>.<ext>  so
+files sort by date, stay self-describing if moved, and never duplicate across
+runs. A CSV manifest sits at the top level.
 """
 
 from __future__ import annotations
@@ -310,14 +311,19 @@ class Store:
         self._scan()
 
     def _scan(self) -> None:
-        """Index existing files and any per-source progress written before."""
+        """
+        Index existing files and any per-source progress written before.
+
+        Walks subfolders too, since files live in a folder per child.
+        """
+        for sub, _dirs, files in os.walk(self.dir):
+            for name in files:
+                m = re.match(r"\d{8}_(?:[a-z0-9]+_)?([0-9a-f]{12})", name)
+                if m:
+                    self._hashes.add(m.group(1))
         for name in os.listdir(self.dir):
             # Accept both the old YYYYMMDD_<hash> and the current
             # YYYYMMDD_<child>_<hash> form, so existing files still de-duplicate.
-            m = re.match(r"\d{8}_(?:[a-z0-9]+_)?([0-9a-f]{12})", name)
-            if m:
-                self._hashes.add(m.group(1))
-                continue
             m = re.match(r"\.progress_(\w+)\.json$", name)
             if m:
                 try:
@@ -386,16 +392,21 @@ class Store:
         who = f"{item.child}_" if item.child else ""
         name = f"{item.when.strftime('%Y%m%d')}_{who}{digest}" \
                f"{self._ext(item.url, content_type, item.is_video)}"
-        path = os.path.join(self.dir, name)
+        # Each child gets a folder; the name still carries the child so a file
+        # remains self-describing if it is ever moved out.
+        subdir = os.path.join(self.dir, item.child) if item.child else self.dir
+        os.makedirs(subdir, exist_ok=True)
+        path = os.path.join(subdir, name)
+        rel = os.path.join(item.child, name) if item.child else name
         if os.path.exists(path):
-            return name, "dup"
+            return rel, "dup"
         tmp = path + ".part"
         with open(tmp, "wb") as fh:
             fh.write(data)
         os.replace(tmp, path)
         with self._lock:
-            self._rows.append((name, item.when.isoformat(), item.week, item.url))
-        return name, "saved"
+            self._rows.append((rel, item.when.isoformat(), item.week, item.url))
+        return rel, "saved"
 
     def write_manifest(self) -> None:
         with self._lock:
@@ -410,16 +421,29 @@ class Store:
                 fh.write('"{}","{}","{}","{}"\n'.format(*r))
 
     def summary(self) -> tuple[int, int]:
+        """Count and size every media file, including per-child subfolders."""
         total = size = 0
-        for name in os.listdir(self.dir):
-            if name.startswith(".") or name == MANIFEST_NAME:
-                continue
-            total += 1
-            try:
-                size += os.path.getsize(os.path.join(self.dir, name))
-            except OSError:
-                pass
+        for sub, _dirs, files in os.walk(self.dir):
+            for name in files:
+                if name.startswith(".") or name == MANIFEST_NAME \
+                        or name.endswith(".part"):
+                    continue
+                total += 1
+                try:
+                    size += os.path.getsize(os.path.join(sub, name))
+                except OSError:
+                    pass
         return total, size
+
+    def per_child(self) -> dict:
+        """{child folder: file count} for the closing report."""
+        out = {}
+        for entry in sorted(os.listdir(self.dir)):
+            full = os.path.join(self.dir, entry)
+            if os.path.isdir(full):
+                out[entry] = len([f for f in os.listdir(full)
+                                  if not f.startswith(".")])
+        return out
 
 
 # --------------------------------------------------------------------------- #
@@ -1267,6 +1291,60 @@ def ensure_session(force_relogin: bool = False) -> Auth:
 # --------------------------------------------------------------------------- #
 # CLI
 # --------------------------------------------------------------------------- #
+def organize_into_folders(store: Store) -> None:
+    """
+    Move already-downloaded files into a folder per child.
+
+    Works purely from the filenames (YYYYMMDD_<child>_<hash>.<ext>), so it needs
+    no network. Files without a child segment stay where they are rather than
+    being guessed at. The manifest's filename column becomes '<child>/<name>'.
+    """
+    moved = left = 0
+    mapping: dict[str, str] = {}
+    for name in sorted(os.listdir(store.dir)):
+        src = os.path.join(store.dir, name)
+        if not os.path.isfile(src) or name.startswith(".") or name == MANIFEST_NAME:
+            continue
+        m = re.match(r"\d{8}_([a-z0-9]+)_[0-9a-f]{12}\.\w+$", name)
+        if not m:
+            left += 1
+            continue
+        child = m.group(1)
+        subdir = os.path.join(store.dir, child)
+        os.makedirs(subdir, exist_ok=True)
+        dst = os.path.join(subdir, name)
+        if os.path.exists(dst):
+            left += 1
+            continue
+        try:
+            os.rename(src, dst)
+            mapping[name] = os.path.join(child, name)
+            moved += 1
+        except OSError:
+            left += 1
+
+    # Point the manifest at the new locations.
+    try:
+        with open(store.manifest) as fh:
+            lines = fh.read().splitlines()
+        header, body, out = lines[0], lines[1:], []
+        for line in body:
+            parts = re.findall(r'"([^"]*)"', line)
+            if len(parts) >= 4 and parts[0] in mapping:
+                out.append(f'"{mapping[parts[0]]}","{parts[1]}","{parts[2]}","{parts[3]}"')
+            else:
+                out.append(line)
+        with open(store.manifest, "w") as fh:
+            fh.write(header + "\n" + "\n".join(out) + "\n")
+    except OSError:
+        pass
+
+    print(f"\n  moved {moved} file(s) into per-child folders, "
+          f"left {left} in place (no child in the name)")
+    for child, n in store.per_child().items():
+        print(f"    {child}/  {n} file(s)")
+
+
 def rename_with_children(store: Store, api: Api, kids: list, target: dt.date) -> None:
     """
     Add the child's name to files downloaded before naming included it.
@@ -1391,6 +1469,9 @@ def main() -> None:
     ap.add_argument("--kid", metavar="ID",
                     help="Limit to one child (id prefix). Default: all children "
                          "on the account.")
+    ap.add_argument("--organize", action="store_true",
+                    help="Move already-downloaded files into a folder per "
+                         "child. Uses the filenames only; downloads nothing.")
     ap.add_argument("--rename-existing", action="store_true",
                     help="Add the child's name to files downloaded before "
                          "names were included. Renames in place using the "
@@ -1456,12 +1537,21 @@ def main() -> None:
 
     t0 = time.time()
 
+    # ------------------------- organize only ------------------------- #
+    if args.organize:
+        organize_into_folders(store)
+        count, size = store.summary()
+        print(f"\n  Folder now holds : {count} file(s), {human_size(size)}")
+        print(f"  FILES ARE IN     : {store.dir}")
+        return
+
     # ------------------------- rename only ------------------------- #
     if args.rename_existing:
         if not api or not auth.kids:
             print("!! renaming needs API access; try --relogin")
             sys.exit(1)
         rename_with_children(store, api, auth.kids, target)
+        organize_into_folders(store)
         count, size = store.summary()
         print(f"\n  Folder now holds : {count} file(s), {human_size(size)}")
         print(f"  FILES ARE IN     : {store.dir}")
@@ -1566,6 +1656,8 @@ def main() -> None:
     print(f"  Downloaded this run : {human_size(stats.bytes)} "
           f"in {(time.time() - t0) / 60:.1f} min")
     print(f"  Folder now holds    : {count} file(s), {human_size(size)}")
+    for child, n in store.per_child().items():
+        print(f"      {child}/{'':<14} {n} file(s)")
     print(f"  FILES ARE IN        : {store.dir}")
     print(f"  Manifest            : {store.manifest}")
     print("=" * 72)

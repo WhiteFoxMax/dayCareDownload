@@ -14,8 +14,8 @@ You log in yourself, in a real browser window. Nothing here bypasses authenticat
   Photos/Videos gallery — together they cover photos the gallery alone omits
 - Covers **every child on the account**, not just the first one
 - Grabs the **full-size original** of every item (not the gallery thumbnail)
-- Saves everything **flat** into a folder you choose as `YYYYMMDD_<child>_<contenthash>.jpg` / `.mp4`
-  — sorts by date, and each file says which child it is of
+- Saves **one folder per child**, with files named `YYYYMMDD_<child>_<contenthash>.jpg` / `.mp4`
+  so they sort by date and stay self-describing if moved
 - **Never duplicates**: filenames are a hash of the file's contents
 - **Resumable**: interrupt with Ctrl-C any time and re-run; it picks up where it stopped
 - **Logs in once**: the browser session is saved and reused on later runs
@@ -95,7 +95,17 @@ python procare_download.py --source feed      # activity feed only
 A photo appearing in both is downloaded once: sources share progress, so the
 second one skips it before fetching anything.
 
-### File names
+### Layout and file names
+
+```
+procare_media/
+├── liana/
+│   ├── 20260813_liana_c523f65ce802.jpg
+│   └── 20260812_liana_170df95c98e2.jpg
+├── theodore/
+│   └── 20251030_theodore_a4f5e49912a0.jpg
+└── procare_manifest.csv
+```
 
 ```
 20260813_liana_c523f65ce802.jpg
@@ -110,14 +120,16 @@ the same name.
 A photo of two children is a single file on Procare's side, so it is stored once,
 under whichever child's walk reached it first.
 
-If you have files from an older version without the child segment:
+Migrating a folder from an older version — both downloads nothing:
 
 ```bash
-python procare_download.py -o <folder> --rename-existing
+python procare_download.py -o <folder> --rename-existing   # add child names, then file them
+python procare_download.py -o <folder> --organize          # file existing names into folders
 ```
 
-That rebuilds the file-to-child map from the API and renames in place, updating
-the manifest. It downloads nothing.
+`--rename-existing` rebuilds the file-to-child map from the API; `--organize`
+works from the filenames alone. Both update the manifest, and files whose child
+can't be determined are left untouched rather than guessed at.
 
 ### Choosing where files go
 
@@ -140,7 +152,8 @@ The folder is created if it doesn't exist, `~` is expanded, and the manifest and
 | `-d, --dl-threads M` | Parallel download threads (default 12) |
 | `--source all\|api\|gallery\|feed` | Where to look (default `all` = API + gallery) |
 | `--kid ID` | Limit to one child (id prefix); default is all children |
-| `--rename-existing` | Add child names to files downloaded before naming included them |
+| `--rename-existing` | Add child names to older downloads, then file them into folders |
+| `--organize` | Move existing files into a folder per child (offline) |
 | `--photos-only` / `--videos-only` | Restrict the gallery to one tab |
 | `--show` | Show the browser windows instead of running hidden |
 | `--relogin` | Ignore the saved session and log in again |
