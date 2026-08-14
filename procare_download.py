@@ -179,50 +179,89 @@ def stable_key(url: str) -> str:
     return m.group(0) if m else path
 
 
-def pick_full_size(urls: list[str]) -> str | None:
-    """
-    Choose the real file among a JSON item's CDN URLs.
+# Procare names its renditions explicitly, so pick by key rather than by
+# guessing from the URL. An item looks like:
+#   {thumb_url, medium_url, main_url, video_file_url, is_video, date, ...}
+# and an activity wrapper carries photo_url + activity_time + activity_type.
+URL_KEYS_FULL = ("video_file_url", "main_url", "photo_url")
+URL_KEYS_IGNORE = ("thumb_url", "medium_url", "small_url", "profile_pic_url")
 
-    Videos carry both a poster image and the video itself, so /attachments/
-    wins; otherwise prefer the single /main/ rendition. Ambiguous sets are
-    skipped so two items can never be conflated.
+
+def pick_full_size(node: dict) -> str | None:
+    """
+    The full-size URL for one item dict.
+
+    For a video, only the video file is wanted — its poster frame is a
+    near-duplicate of a frame we don't need. Otherwise the main rendition.
+    """
+    if node.get("is_video") and isinstance(node.get("video_file_url"), str):
+        return node["video_file_url"]
+    # A video activity's photo_url is just the poster frame; the real file is on
+    # the nested item, which recursion reaches anyway.
+    if "video" in str(node.get("activity_type", "")).lower() and node.get("photo_url"):
+        return None
+    for key in URL_KEYS_FULL:
+        val = node.get(key)
+        if isinstance(val, str) and CDN_RE.match(val):
+            return val
+    return None
+
+
+def pick_full_size_heuristic(urls: list[str]) -> str | None:
+    """
+    Fallback for dicts whose keys we don't recognise.
+
+    Prefers the largest named rendition. Earlier this bailed out whenever two
+    non-thumbnail URLs were present — which is every photo item, since they
+    carry both main_url and medium_url — silently dropping the item.
     """
     full = [u for u in dict.fromkeys(urls)
             if "/thumb/" not in u and not re.search(r"profile_pic|avatar", u, re.I)]
     if not full:
         return None
-    if len(full) == 1:
-        return full[0]
-    attachments = [u for u in full if "/attachments/" in u]
-    if len(attachments) == 1:
-        return attachments[0]
-    mains = [u for u in full if "/main/" in u]
-    if len(mains) == 1:
-        return mains[0]
+    for marker in ("/attachments/", "/original/", "/main/", "/medium/"):
+        hits = [u for u in full if marker in u]
+        if hits:
+            return hits[0]
+    return full[0]
+
+
+def item_date(node: dict) -> dt.date | None:
+    for key in ("activity_time", "activity_date", "captured_at", "taken_at",
+                "date", "created_at", "created_on", "uploaded_at"):
+        when = parse_iso(node.get(key))
+        if when:
+            return when
     return None
 
 
-def items_from_json(node, tab: str, out: list[MediaItem], fallback: dt.date) -> None:
-    """Walk a decoded JSON body collecting one MediaItem per media-bearing dict."""
+def items_from_json(node, tab: str, out: list[MediaItem], fallback: dt.date,
+                    inherited_date: dt.date | None = None) -> None:
+    """
+    Walk a decoded JSON body collecting one MediaItem per media-bearing dict.
+
+    Dates are inherited downwards: an activity wrapper carries activity_time
+    while the nested photo object may only have created_at (the upload time),
+    so the wrapper's date wins for anything nested inside it.
+    """
     if isinstance(node, dict):
-        strings = [v for v in node.values() if isinstance(v, str)]
-        urls = [u for s in strings for u in CDN_RE.findall(s)]
-        if urls:
-            chosen = pick_full_size(urls)
-            if chosen:
-                when = None
-                for k in DATE_KEYS:
-                    when = parse_iso(node.get(k))
-                    if when:
-                        break
-                out.append(MediaItem(
-                    url=chosen, key=stable_key(chosen),
-                    when=when or date_in_url(chosen) or fallback, tab=tab))
+        here = item_date(node) or inherited_date
+        chosen = pick_full_size(node)
+        if not chosen:
+            strings = [v for k, v in node.items()
+                       if isinstance(v, str) and k not in URL_KEYS_IGNORE]
+            urls = [u for s in strings for u in CDN_RE.findall(s)]
+            if urls:
+                chosen = pick_full_size_heuristic(urls)
+        if chosen:
+            out.append(MediaItem(
+                url=chosen, key=stable_key(chosen),
+                when=here or date_in_url(chosen) or fallback, tab=tab))
         for v in node.values():
-            items_from_json(v, tab, out, fallback)
+            items_from_json(v, tab, out, fallback, here)
     elif isinstance(node, list):
         for v in node:
-            items_from_json(v, tab, out, fallback)
+            items_from_json(v, tab, out, fallback, inherited_date)
 
 
 # --------------------------------------------------------------------------- #
@@ -833,6 +872,145 @@ def walk_feed(target: dt.date, headless: bool, store: Store | None,
 
 
 # --------------------------------------------------------------------------- #
+# Direct API access
+# --------------------------------------------------------------------------- #
+API_BASE = "https://api-school.procareconnect.com"
+EP_KIDS = "/api/web/parent/kids/"
+EP_ACTIVITIES = "/api/web/parent/daily_activities/"
+EP_PHOTOS = "/api/web/parent/photos/"
+
+
+class Api:
+    """
+    Talks to Procare's API the way the web app does.
+
+    Far more reliable than scraping: the feed's own endpoint is paged and
+    date-filtered, so nothing depends on scroll timing or what happens to be
+    rendered. Auth is the Bearer token captured from the logged-in browser and
+    kept only in memory.
+    """
+
+    def __init__(self, headers: dict):
+        self.s = requests.Session()
+        self.s.headers.update(headers)
+
+    def get(self, path: str, params: dict | None = None) -> dict:
+        r = self.s.get(API_BASE + path, params=params or {}, timeout=90)
+        r.raise_for_status()
+        return r.json()
+
+    def kids(self) -> list[dict]:
+        try:
+            return self.get(EP_KIDS).get("kids", [])
+        except Exception:
+            return []
+
+    @staticmethod
+    def _rows(payload) -> list:
+        """Find the list of records in a response, whatever it's called."""
+        if isinstance(payload, list):
+            return payload
+        if not isinstance(payload, dict):
+            return []
+        for key in ("daily_activities", "activities", "photos", "results",
+                    "data", "items"):
+            val = payload.get(key)
+            if isinstance(val, list):
+                return val
+        for val in payload.values():         # fall back to the longest list
+            if isinstance(val, list) and val and isinstance(val[0], dict):
+                return val
+        return []
+
+    def activities(self, kid_id: str, date_to: dt.date, page: int) -> list:
+        payload = self.get(EP_ACTIVITIES, {
+            "kid_id": kid_id,
+            "filters[daily_activity][date_to]": date_to.isoformat(),
+            "page": page,
+        })
+        return self._rows(payload)
+
+    def photos(self, kid_id: str, page: int) -> list:
+        payload = self.get(EP_PHOTOS, {"kid_id": kid_id, "page": page})
+        return self._rows(payload)
+
+
+def walk_api(kid_id: str, kid_name: str, api: Api, target: dt.date,
+             store: Store | None, pool: DownloadPool | None, stats: Stats,
+             tab: str = "api") -> WalkResult:
+    """
+    Page the activity API back to the target date.
+
+    This is the authoritative source: the same endpoint the feed uses, but read
+    directly, so no photo can be missed because a scroll didn't render it.
+    """
+    who = f"api:{kid_name[:6]}" if kid_name else "api"
+    res = WalkResult()
+    seen: set[str] = set()
+    date_to = dt.date.today()
+    page = 1
+    empty_pages = 0
+
+    while page <= 500:
+        try:
+            rows = api.activities(kid_id, date_to, page)
+        except Exception as exc:
+            log(who, f"API error on page {page}: {str(exc)[:70]}")
+            break
+        if not rows:
+            empty_pages += 1
+            if empty_pages >= 2:
+                log(who, f"no more activities (page {page})")
+                break
+            page += 1
+            continue
+        empty_pages = 0
+
+        found: list[MediaItem] = []
+        items_from_json(rows, tab, found, date_to)
+
+        oldest = None
+        for row in rows:
+            d = item_date(row) if isinstance(row, dict) else None
+            if d and (oldest is None or d < oldest):
+                oldest = d
+        if oldest:
+            res.oldest = oldest
+            res.newest = res.newest or oldest
+
+        queued = 0
+        for it in found:
+            if it.key in seen:
+                continue
+            seen.add(it.key)
+            if store and store.is_done(tab, it.key):
+                continue
+            res.items += 1
+            if pool:
+                pool.submit(MediaItem(it.url, it.key, it.when, tab,
+                                      it.when.isoformat()))
+                queued += 1
+                stats.bump(tab, "fast")
+
+        res.weeks = page
+        if queued or page % 10 == 0:
+            log(who, f"page {page}: {len(rows)} activities, oldest={oldest}, "
+                     f"media={res.items}" +
+                (f", queued={queued} [q={pool.pending()}]" if pool else ""))
+        if store:
+            store.save_progress(tab)
+
+        if oldest and oldest <= target:
+            res.reached = True
+            log(who, f"reached target {oldest} <= {target}")
+            break
+        page += 1
+
+    log(who, f"done: {res.weeks} page(s), {res.items} media item(s)")
+    return res
+
+
+# --------------------------------------------------------------------------- #
 # Walking a tab
 # --------------------------------------------------------------------------- #
 @dataclass
@@ -967,8 +1145,21 @@ def walk_tab(tab: str, gid: str, target: dt.date, headless: bool,
 # --------------------------------------------------------------------------- #
 # Session
 # --------------------------------------------------------------------------- #
-def ensure_session(force_relogin: bool = False) -> str | None:
-    """Reuse the saved session if it works, else log in once and save it."""
+@dataclass
+class Auth:
+    gallery_id: str | None = None
+    headers: dict = field(default_factory=dict)   # incl. the Bearer token
+    kids: list = field(default_factory=list)
+
+
+def ensure_session(force_relogin: bool = False) -> Auth:
+    """
+    Reuse the saved session if it works, else log in once and save it.
+
+    Also captures the API request headers (the Bearer token the web app uses),
+    which stay in memory only — they are never written to disk or logged.
+    """
+    auth = Auth()
     have = os.path.exists(SESSION_FILE) and not force_relogin
     with sync_playwright() as p:
         browser = p.chromium.launch(headless=False)
@@ -976,6 +1167,22 @@ def ensure_session(force_relogin: bool = False) -> str | None:
             storage_state=SESSION_FILE if have else None,
             viewport={"width": 1500, "height": 950})
         page = context.new_page()
+
+        def on_request(req):
+            try:
+                if "api-school.procareconnect.com" not in req.url or auth.headers:
+                    return
+                h = req.headers
+                if not h.get("authorization"):
+                    return
+                auth.headers = {k: v for k, v in h.items()
+                                if k.lower() in ("authorization", "accept",
+                                                 "requested-from", "user-agent",
+                                                 "referer", "origin")}
+            except Exception:
+                pass
+
+        page.on("request", on_request)
         page.goto(f"{BASE}/dashboard", wait_until="domcontentloaded")
         time.sleep(4.0)
 
@@ -1020,13 +1227,22 @@ def ensure_session(force_relogin: bool = False) -> str | None:
                 if gid:
                     break
 
+        # Nudge the app into an API call if we haven't seen one yet.
+        if not auth.headers:
+            page.goto(f"{BASE}/dashboard", wait_until="domcontentloaded")
+            time.sleep(4.0)
+
         context.storage_state(path=SESSION_FILE)
         try:
             os.chmod(SESSION_FILE, 0o600)
         except Exception:
             pass
         browser.close()
-        return gid
+
+    auth.gallery_id = gid
+    if auth.headers:
+        auth.kids = Api(auth.headers).kids()
+    return auth
 
 
 # --------------------------------------------------------------------------- #
@@ -1066,10 +1282,15 @@ def main() -> None:
                     help=f"Stop once this week is reached (default {DEFAULT_TARGET})")
     ap.add_argument("--nav-test", action="store_true",
                     help="Verify the whole range is reachable; download nothing.")
-    ap.add_argument("--source", choices=["all", "gallery", "feed"], default="all",
-                    help="Where to look: the Photos/Videos gallery, the dashboard "
-                         "activity feed (which holds photos the gallery omits), "
-                         "or both (default).")
+    ap.add_argument("--source", choices=["all", "api", "gallery", "feed"],
+                    default="all",
+                    help="Where to look. 'api' reads the activity endpoint "
+                         "directly (fastest and most complete), 'gallery' and "
+                         "'feed' scrape the pages. Default 'all' does the API "
+                         "plus the gallery, which together cover everything.")
+    ap.add_argument("--kid", metavar="ID",
+                    help="Limit to one child (id prefix). Default: all children "
+                         "on the account.")
     ap.add_argument("--photos-only", action="store_true")
     ap.add_argument("--videos-only", action="store_true")
     ap.add_argument("--relogin", action="store_true",
@@ -1089,10 +1310,11 @@ def main() -> None:
         tabs = ["photos"]
     if args.videos_only:
         tabs = ["videos"]
-    if args.source == "feed":
+    if args.source in ("feed", "api"):
         tabs = []
-    use_feed = args.source in ("all", "feed")
-    sources = tabs + (["feed"] if use_feed else [])
+    use_feed = args.source == "feed"
+    use_api = args.source in ("all", "api")
+    sources = tabs + (["feed"] if use_feed else []) + (["api"] if use_api else [])
 
     store = Store(args.out)
     stats = Stats()
@@ -1106,9 +1328,26 @@ def main() -> None:
     print(f"  Sources         : {', '.join(sources)}")
     print("=" * 72 + "\n")
 
-    gid = ensure_session(args.relogin)
-    if not gid:
-        print("!! Could not determine the gallery id. Open Photos/Videos, then re-run.")
+    auth = ensure_session(args.relogin)
+    gid = auth.gallery_id
+    api = Api(auth.headers) if auth.headers else None
+
+    if auth.kids:
+        print(f"  Children on the account: "
+              f"{', '.join(k.get('name') or k.get('first_name') or k.get('id', '?')[:8] for k in auth.kids)}")
+    if api:
+        print("  API access: OK (reading the feed's own endpoint directly)")
+    else:
+        print("  API access: unavailable — falling back to browser scraping")
+
+    kid_ids = [k["id"] for k in auth.kids if k.get("id")]
+    if args.kid and args.kid != "all":
+        kid_ids = [k for k in kid_ids if k.startswith(args.kid)]
+    if not kid_ids and gid:
+        kid_ids = [gid]
+
+    if not gid and not kid_ids:
+        print("!! Could not determine the gallery/kid id. Open Photos/Videos, then re-run.")
         sys.exit(1)
 
     t0 = time.time()
@@ -1126,9 +1365,14 @@ def main() -> None:
             results["feed"] = walk_feed(target, headless, None, None, stats,
                                         dry_run=True)
 
+        def nav_api():
+            results["api"] = walk_api(kid_ids[0], "", api, target, None, None, stats)
+
         threads = [threading.Thread(target=nav, args=(t,)) for t in tabs]
         if use_feed:
             threads.append(threading.Thread(target=nav_feed))
+        if use_api and api and kid_ids:
+            threads.append(threading.Thread(target=nav_api))
         for t in threads:
             t.start()
         for t in threads:
@@ -1160,14 +1404,26 @@ def main() -> None:
     print(f"  {args.dl_threads} download threads, "
           f"{args.workers} browser worker(s) on photos\n")
 
-    jobs = build_jobs(tabs, args.workers, target)
-    threads = [threading.Thread(
-        target=walk_tab,
-        args=(tab, gid, target, headless, store, pool, stats, wk, skip, mx))
-        for tab, wk, skip, mx in jobs]
+    # The gallery URL is /dashboard/gallery/<kid_id>/..., so every child needs
+    # its own walk — otherwise siblings' videos are silently never visited.
+    threads = []
+    for kid_id in (kid_ids or [gid]):
+        for tab, wk, skip, mx in build_jobs(tabs, args.workers, target):
+            threads.append(threading.Thread(
+                target=walk_tab,
+                args=(tab, kid_id, target, headless, store, pool, stats,
+                      wk, skip, mx)))
     if use_feed:
         threads.append(threading.Thread(
             target=walk_feed, args=(target, headless, store, pool, stats)))
+    if use_api and api:
+        for kid in (auth.kids or [{"id": k, "name": ""} for k in kid_ids]):
+            if kid.get("id") not in kid_ids:
+                continue
+            threads.append(threading.Thread(
+                target=walk_api,
+                args=(kid["id"], kid.get("name") or kid.get("first_name") or "",
+                      api, target, store, pool, stats)))
     for t in threads:
         t.start()
     for t in threads:

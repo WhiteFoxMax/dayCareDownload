@@ -10,8 +10,9 @@ You log in yourself, in a real browser window. Nothing here bypasses authenticat
 
 ## What it does
 
-- Walks **two independent sources**: the Photos/Videos gallery (week by week) and the
-  dashboard activity feed, which holds photos that never reach the gallery
+- Reads Procare's **own API** (the endpoint the app itself uses) plus the
+  Photos/Videos gallery — together they cover photos the gallery alone omits
+- Covers **every child on the account**, not just the first one
 - Grabs the **full-size original** of every item (not the gallery thumbnail)
 - Saves everything **flat** into a folder you choose as `YYYYMMDD_<contenthash>.jpg` / `.mp4`
 - **Never duplicates**: filenames are a hash of the file's contents
@@ -112,7 +113,8 @@ The folder is created if it doesn't exist, `~` is expanded, and the manifest and
 | `--nav-test` | Verify the date range is reachable; download nothing |
 | `-w, --workers N` | Browsers splitting the photo date range (default 2) |
 | `-d, --dl-threads M` | Parallel download threads (default 12) |
-| `--source all\|gallery\|feed` | Which source to scrape (default `all`) |
+| `--source all\|api\|gallery\|feed` | Where to look (default `all` = API + gallery) |
+| `--kid ID` | Limit to one child (id prefix); default is all children |
 | `--photos-only` / `--videos-only` | Restrict the gallery to one tab |
 | `--show` | Show the browser windows instead of running hidden |
 | `--relogin` | Ignore the saved session and log in again |
@@ -127,7 +129,11 @@ Three pieces, none of which waits on anything it doesn't have to:
 
 **Gallery** drives one browser tab. Changing week is *network*-driven: it waits for the gallery's own JSON payload rather than polling the DOM for tiles to settle, and it reads the items straight out of that payload. The photo viewer is never opened in the normal path.
 
-**Feed** scrolls the dashboard activity list, which loads ~30 activities at a time. It scrolls `section.section` — the window itself doesn't scroll, and `div.activity-list` has `scrollHeight == clientHeight`, so neither of those works. Items come from the same JSON payloads.
+**API** pages `/api/web/parent/daily_activities/` directly, using the Bearer token captured from the logged-in browser (kept in memory, never written to disk). This is the authoritative source and the fastest — a year of history is ~100 pages in well under a minute — and unlike scraping it cannot miss an item because something failed to render.
+
+**Feed** (`--source feed`) scrolls the same activities in the DOM. Superseded by the API path; kept as a fallback.
+
+Renditions are chosen **by key**, not guessed from the URL: `main_url` for photos, `video_file_url` for videos, ignoring `thumb_url`/`medium_url`. Dates inherit the enclosing activity's `activity_time`, so a photo taken Monday but uploaded Wednesday files under Monday.
 
 **Walker** steps back week by week, turns payloads into items, and pushes them onto a queue. Only items the JSON doesn't explain fall back to clicking a tile and reading the viewer's download link.
 

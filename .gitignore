@@ -255,3 +255,6 @@ __marimo__/
 
 # Streamlit
 .streamlit/secrets.toml
+
+# Diagnostic payload dumps (contain signed media URLs)
+tools/sample_payload.json
