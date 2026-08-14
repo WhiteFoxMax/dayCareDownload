@@ -231,6 +231,12 @@ Open the gallery, inspect the element, and update the matching line.
 
 ---
 
+## Changelog
+
+See [CHANGELOG.md](CHANGELOG.md) for what changed and why.
+
+---
+
 ## Notes
 
 Written for personal use, to get my own kid's photos out of a portal that has no bulk export. It fetches only what your account can already see, at a human-ish pace. Don't point it at an account that isn't yours.
