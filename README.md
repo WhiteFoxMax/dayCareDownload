@@ -1,4 +1,4 @@
-# dayCareDownload
+# ProcareDownloadPics
 
 Bulk-download **your own** photos and videos from the [Procare](https://www.procaresoftware.com/) parent portal (`schools.procareconnect.com`).
 
@@ -39,8 +39,8 @@ You log in yourself, in a real browser window. Nothing here bypasses authenticat
 Everything lives inside a virtual environment in the project folder — nothing is installed system-wide.
 
 ```bash
-git clone https://github.com/WhiteFoxMax/dayCareDownload.git
-cd dayCareDownload
+git clone https://github.com/WhiteFoxMax/ProcareDownloadPics.git
+cd ProcareDownloadPics
 python3 -m venv venv
 source venv/bin/activate
 pip install -r requirements.txt
@@ -54,7 +54,7 @@ On Windows, activate with `venv\Scripts\activate` instead.
 **Every later session** starts with:
 
 ```bash
-cd dayCareDownload
+cd ProcareDownloadPics
 source venv/bin/activate
 ```
 
