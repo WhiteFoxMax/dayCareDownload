@@ -2,7 +2,7 @@
 
 Bulk-download **your own** photos and videos from the [Procare](https://www.procaresoftware.com/) parent portal (`schools.procareconnect.com`).
 
-Procare's web gallery only lets you save one file at a time, a week at a time. This script walks the gallery week by week, back to whatever date you choose, and saves every photo and video at full resolution — named by date, de-duplicated, and resumable.
+Procare's web gallery only lets you save one file at a time, a week at a time — and some photos never appear there at all, only in the dashboard activity feed. This script walks both, back to whatever date you choose, and saves every photo and video at full resolution — named by date, de-duplicated, and resumable.
 
 You log in yourself, in a real browser window. Nothing here bypasses authentication, and your password is never stored.
 
@@ -10,7 +10,8 @@ You log in yourself, in a real browser window. Nothing here bypasses authenticat
 
 ## What it does
 
-- Walks the **Photos** and **Videos** tabs of the gallery week by week, back to a target date
+- Walks **two independent sources**: the Photos/Videos gallery (week by week) and the
+  dashboard activity feed, which holds photos that never reach the gallery
 - Grabs the **full-size original** of every item (not the gallery thumbnail)
 - Saves everything **flat** into a folder you choose as `YYYYMMDD_<contenthash>.jpg` / `.mp4`
 - **Never duplicates**: filenames are a hash of the file's contents
@@ -79,6 +80,19 @@ The full path being written to is printed **before** downloading starts and agai
 
 Re-run the same command any time to pick up newly posted photos — existing files are skipped.
 
+### Where photos hide
+
+Not every photo reaches the Photos/Videos gallery — some are only ever posted as
+activities in the dashboard feed. Both are scraped by default. To pick one:
+
+```bash
+python procare_download.py --source gallery   # gallery only
+python procare_download.py --source feed      # activity feed only
+```
+
+A photo appearing in both is downloaded once: sources share progress, so the
+second one skips it before fetching anything.
+
 ### Choosing where files go
 
 By default everything lands in `./procare_media`. Point it anywhere with `-o`:
@@ -98,7 +112,8 @@ The folder is created if it doesn't exist, `~` is expanded, and the manifest and
 | `--nav-test` | Verify the date range is reachable; download nothing |
 | `-w, --workers N` | Browsers splitting the photo date range (default 2) |
 | `-d, --dl-threads M` | Parallel download threads (default 12) |
-| `--photos-only` / `--videos-only` | Restrict to one tab |
+| `--source all\|gallery\|feed` | Which source to scrape (default `all`) |
+| `--photos-only` / `--videos-only` | Restrict the gallery to one tab |
 | `--show` | Show the browser windows instead of running hidden |
 | `--relogin` | Ignore the saved session and log in again |
 
@@ -111,6 +126,8 @@ The defaults are tuned for a normal laptop. More workers means more browsers, so
 Three pieces, none of which waits on anything it doesn't have to:
 
 **Gallery** drives one browser tab. Changing week is *network*-driven: it waits for the gallery's own JSON payload rather than polling the DOM for tiles to settle, and it reads the items straight out of that payload. The photo viewer is never opened in the normal path.
+
+**Feed** scrolls the dashboard activity list, which loads ~30 activities at a time. It scrolls `section.section` — the window itself doesn't scroll, and `div.activity-list` has `scrollHeight == clientHeight`, so neither of those works. Items come from the same JSON payloads.
 
 **Walker** steps back week by week, turns payloads into items, and pushes them onto a queue. Only items the JSON doesn't explain fall back to clicking a tile and reading the viewer's download link.
 
@@ -147,6 +164,8 @@ SEL_DROPDOWN   = "div.date-filter .dropdown-portal__header"   # Daily/Weekly pic
 SEL_DATE_TITLE = '[data-testid="datepicker-title"]'           # "Aug 10 - Aug 16"
 SEL_TILE       = "div.gallery__item"                          # a photo tile
 SEL_DL_ANCHOR  = "a.action-button[href], a[download][href]"   # the download link
+SEL_ACTIVITY   = "div.activity"                               # a feed activity
+SEL_ACTIVITY_DATE = "div.activity-date"                       # "Aug 12, 2026"
 ```
 
 Open the gallery, inspect the element, and update the matching line.

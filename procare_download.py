@@ -53,6 +53,7 @@ MANIFEST_NAME = "procare_manifest.csv"
 
 DEFAULT_TARGET = dt.date(2025, 8, 18)
 MAX_WEEKS = 200
+MAX_FEED_SCROLLS = 600     # feed loads ~30 activities per scroll
 
 # Timing. Week changes are detected via the network, so these are just ceilings.
 WEEK_TIMEOUT = 20.0        # hard cap waiting for a week to load
@@ -67,6 +68,11 @@ SEL_ARROW = "div.date-filter .datepicker__arrow"              # < and > week arr
 SEL_TILE = "div.gallery__item"                                # one media tile
 SEL_MODAL = "div.modal"
 SEL_DL_ANCHOR = "a.action-button[href], a[download][href]"    # full-size link
+
+# Dashboard activity feed — holds photos that never appear in the gallery.
+SEL_ACTIVITY_LIST = "div.activity-list"
+SEL_ACTIVITY = "div.activity"
+SEL_ACTIVITY_DATE = "div.activity-date"
 
 IMAGE_EXTS = (".jpg", ".jpeg", ".png", ".gif", ".webp", ".heic")
 VIDEO_EXTS = (".mp4", ".mov", ".m4v", ".webm")
@@ -252,21 +258,24 @@ class Store:
         self.manifest = os.path.join(self.dir, MANIFEST_NAME)
         self._lock = threading.Lock()
         self._hashes: set[str] = set()
-        self._done: dict[str, set[str]] = {"photos": set(), "videos": set()}
+        self._done: dict[str, set[str]] = {}
         self._rows: list[tuple] = []
         self._scan()
 
     def _scan(self) -> None:
+        """Index existing files and any per-source progress written before."""
         for name in os.listdir(self.dir):
             m = re.match(r"\d{8}_([0-9a-f]{12})", name)
             if m:
                 self._hashes.add(m.group(1))
-        for tab in self._done:
-            try:
-                with open(self._progress_path(tab)) as fh:
-                    self._done[tab] = set(json.load(fh))
-            except Exception:
-                pass
+                continue
+            m = re.match(r"\.progress_(\w+)\.json$", name)
+            if m:
+                try:
+                    with open(os.path.join(self.dir, name)) as fh:
+                        self._done[m.group(1)] = set(json.load(fh))
+                except Exception:
+                    pass
 
     def _progress_path(self, tab: str) -> str:
         return os.path.join(self.dir, f".progress_{tab}.json")
@@ -275,16 +284,25 @@ class Store:
         return len(self._hashes)
 
     def is_done(self, tab: str, key: str) -> bool:
+        """
+        Has this file been fetched by ANY source?
+
+        The gallery and the feed serve the same photo under the same file UUID,
+        so checking every source's progress avoids re-downloading a file just to
+        discover by content hash that we already have it. Progress is still
+        recorded per source.
+        """
         with self._lock:
-            return key in self._done[tab]
+            self._done.setdefault(tab, set())
+            return any(key in done for done in self._done.values())
 
     def mark_done(self, tab: str, key: str) -> None:
         with self._lock:
-            self._done[tab].add(key)
+            self._done.setdefault(tab, set()).add(key)
 
     def save_progress(self, tab: str) -> None:
         with self._lock:
-            keys = sorted(self._done[tab])
+            keys = sorted(self._done.setdefault(tab, set()))
         try:
             with open(self._progress_path(tab), "w") as fh:
                 json.dump(keys, fh)
@@ -426,18 +444,17 @@ class DownloadPool:
 # --------------------------------------------------------------------------- #
 # Gallery — one browser tab
 # --------------------------------------------------------------------------- #
-class Gallery:
+class PayloadSource:
     """
-    Wraps a Playwright page on the gallery.
+    Base for pages whose data arrives as JSON.
 
-    Week changes are detected from the network: a click on the < arrow triggers
-    a JSON payload, and that payload is both the completion signal AND the data.
-    That avoids polling the DOM for tiles to settle, which was the slow part.
+    Captures every JSON response containing Procare URLs, so callers can read
+    items from the API payload rather than scraping the rendered DOM. `seq`
+    also doubles as a "something loaded" signal for waiting on navigation.
     """
 
-    def __init__(self, page, tab: str):
+    def __init__(self, page):
         self.page = page
-        self.tab = tab
         self._payloads: list = []
         self._seq = 0
         self._lock = threading.Lock()
@@ -448,7 +465,7 @@ class Gallery:
             if "json" not in resp.headers.get("content-type", "").lower():
                 return
             body = resp.text()
-            if not body or len(body) > 4_000_000:
+            if not body or len(body) > 6_000_000:
                 return
             with self._lock:
                 self._seq += 1
@@ -457,7 +474,6 @@ class Gallery:
         except Exception:
             pass
 
-    # -- payload access ---------------------------------------------------- #
     def take_payloads(self) -> list:
         with self._lock:
             out, self._payloads = self._payloads, []
@@ -474,6 +490,20 @@ class Gallery:
             self.page.evaluate("1")
         except Exception:
             pass
+
+
+class Gallery(PayloadSource):
+    """
+    The Photos/Videos gallery, paged by its weekly date filter.
+
+    Week changes are detected from the network: a click on the < arrow triggers
+    a JSON payload, and that payload is both the completion signal AND the data.
+    That avoids polling the DOM for tiles to settle, which was the slow part.
+    """
+
+    def __init__(self, page, tab: str):
+        super().__init__(page)
+        self.tab = tab
 
     # -- navigation -------------------------------------------------------- #
     def open(self, gid: str) -> None:
@@ -625,6 +655,181 @@ class Gallery:
             except Exception:
                 pass
         return href
+
+
+class Feed(PayloadSource):
+    """
+    The dashboard activity feed.
+
+    Some photos are posted as activities and never appear in the gallery, so
+    this is a second, independent source. The feed is an infinite scroll that
+    loads ~30 activities at a time inside a nested container (`section.section`,
+    NOT the window), so scrolling has to target that container. Items are read
+    from the JSON payloads, same as the gallery.
+    """
+
+    def open(self) -> None:
+        self.page.goto(f"{BASE}/dashboard", wait_until="domcontentloaded")
+        try:
+            self.page.wait_for_selector(SEL_ACTIVITY, timeout=30000)
+        except Exception:
+            pass
+        time.sleep(1.5)
+
+    def activity_count(self) -> int:
+        try:
+            return self.page.evaluate(
+                "(s) => document.querySelectorAll(s).length", SEL_ACTIVITY)
+        except Exception:
+            return 0
+
+    def oldest_date(self) -> dt.date | None:
+        """Oldest label in the feed. Labels are 'Aug 12, 2026', 'Today', ..."""
+        try:
+            labels = self.page.eval_on_selector_all(
+                SEL_ACTIVITY_DATE, "els => els.map(e => e.textContent.trim())")
+        except Exception:
+            return None
+        dates = []
+        for text in labels:
+            m = re.search(r"([A-Za-z]{3,9})\.?\s+(\d{1,2}),?\s+(\d{4})", text or "")
+            if not m:
+                continue
+            month = MONTHS.get(m.group(1)[:3].lower())
+            if not month:
+                continue
+            try:
+                dates.append(dt.date(int(m.group(3)), month, int(m.group(2))))
+            except ValueError:
+                pass
+        return min(dates) if dates else None
+
+    def _scroll(self) -> None:
+        """
+        Scroll the feed's real container.
+
+        Confirmed by measurement: the feed lives in `section.section`
+        (overflow-y:auto). The window does not scroll, and div.activity-list
+        has scrollHeight == clientHeight, so neither of those works.
+        """
+        js = r"""
+        (listSel) => {
+            const scrolls = el => el && el.scrollHeight > el.clientHeight + 50 &&
+                /(auto|scroll|overlay)/.test(getComputedStyle(el).overflowY);
+            let el = document.querySelector(listSel), target = null;
+            while (el) { if (scrolls(el)) { target = el; break; } el = el.parentElement; }
+            if (!target && scrolls(document.querySelector('section.section')))
+                target = document.querySelector('section.section');
+            if (!target) target = [...document.querySelectorAll('*')].find(scrolls);
+            if (target) { target.scrollTop = target.scrollHeight; return true; }
+            window.scrollTo(0, document.body.scrollHeight);
+            return false;
+        }"""
+        try:
+            self.page.evaluate(js, SEL_ACTIVITY_LIST)
+        except Exception:
+            pass
+
+    def _press_end(self) -> None:
+        """Second scroll technique, also measured to work, used when stuck."""
+        try:
+            box = self.page.query_selector(SEL_ACTIVITY_LIST)
+            if box:
+                b = box.bounding_box()
+                if b:
+                    self.page.mouse.click(b["x"] + 5, b["y"] + 5)
+            self.page.keyboard.press("End")
+        except Exception:
+            pass
+
+    def load_more(self, timeout: float = 12.0) -> bool:
+        """Scroll once and wait for more activities. True if the feed grew."""
+        before = self.activity_count()
+        self._scroll()
+        deadline = time.time() + timeout
+        while time.time() < deadline:
+            time.sleep(0.25)
+            self._pump()
+            if self.activity_count() > before:
+                time.sleep(PAYLOAD_GRACE)
+                self._pump()
+                return True
+        self._press_end()
+        deadline = time.time() + 4.0
+        while time.time() < deadline:
+            time.sleep(0.25)
+            self._pump()
+            if self.activity_count() > before:
+                self._pump()
+                return True
+        return False
+
+
+def walk_feed(target: dt.date, headless: bool, store: Store | None,
+              pool: DownloadPool | None, stats: Stats,
+              dry_run: bool = False) -> WalkResult:
+    """Scroll the activity feed back to the target date, queueing media."""
+    who = "feed"
+    res = WalkResult()
+    seen: set[str] = set()
+    stale = 0
+
+    with sync_playwright() as p:
+        browser = p.chromium.launch(headless=headless)
+        context = browser.new_context(storage_state=SESSION_FILE,
+                                      viewport={"width": 1500, "height": 950})
+        feed = Feed(context.new_page())
+        feed.open()
+
+        for round_no in range(MAX_FEED_SCROLLS):
+            oldest = feed.oldest_date()
+            if oldest:
+                res.oldest = oldest
+                res.newest = res.newest or oldest
+
+            found: list[MediaItem] = []
+            for payload in feed.take_payloads():
+                items_from_json(payload, "feed", found, oldest or dt.date.today())
+
+            queued = 0
+            for it in found:
+                if it.key in seen:
+                    continue
+                seen.add(it.key)
+                if store and store.is_done("feed", it.key):
+                    continue
+                res.items += 1
+                if pool:
+                    pool.submit(MediaItem(it.url, it.key, it.when, "feed",
+                                          it.when.isoformat()))
+                    queued += 1
+                    stats.bump("feed", "fast")
+
+            n = feed.activity_count()
+            res.weeks = round_no + 1
+            if round_no % 5 == 0 or queued:
+                log(who, f"activities={n}  oldest={oldest}  "
+                         f"media={res.items}" +
+                    (f"  queued={queued}  [q={pool.pending()}]" if pool else ""))
+            if store:
+                store.save_progress("feed")
+
+            if oldest and oldest <= target:
+                res.reached = True
+                log(who, f"reached target {oldest} <= {target}")
+                break
+            if not feed.load_more():
+                stale += 1
+                if stale >= 3:
+                    log(who, f"no more activities load (oldest {oldest}) — stopping")
+                    break
+            else:
+                stale = 0
+
+        browser.close()
+
+    log(who, f"done: {res.weeks} scroll(s), {res.items} media item(s)")
+    return res
 
 
 # --------------------------------------------------------------------------- #
@@ -861,6 +1066,10 @@ def main() -> None:
                     help=f"Stop once this week is reached (default {DEFAULT_TARGET})")
     ap.add_argument("--nav-test", action="store_true",
                     help="Verify the whole range is reachable; download nothing.")
+    ap.add_argument("--source", choices=["all", "gallery", "feed"], default="all",
+                    help="Where to look: the Photos/Videos gallery, the dashboard "
+                         "activity feed (which holds photos the gallery omits), "
+                         "or both (default).")
     ap.add_argument("--photos-only", action="store_true")
     ap.add_argument("--videos-only", action="store_true")
     ap.add_argument("--relogin", action="store_true",
@@ -880,6 +1089,10 @@ def main() -> None:
         tabs = ["photos"]
     if args.videos_only:
         tabs = ["videos"]
+    if args.source == "feed":
+        tabs = []
+    use_feed = args.source in ("all", "feed")
+    sources = tabs + (["feed"] if use_feed else [])
 
     store = Store(args.out)
     stats = Stats()
@@ -890,7 +1103,7 @@ def main() -> None:
     print(f"  Download folder : {store.dir}")
     print(f"  Already there   : {store.existing_count()} file(s)")
     print(f"  Going back to   : {target}")
-    print(f"  Tabs            : {', '.join(tabs)}")
+    print(f"  Sources         : {', '.join(sources)}")
     print("=" * 72 + "\n")
 
     gid = ensure_session(args.relogin)
@@ -909,7 +1122,13 @@ def main() -> None:
             results[tab] = walk_tab(tab, gid, target, headless, None, None,
                                     stats, dry_run=True)
 
+        def nav_feed():
+            results["feed"] = walk_feed(target, headless, None, None, stats,
+                                        dry_run=True)
+
         threads = [threading.Thread(target=nav, args=(t,)) for t in tabs]
+        if use_feed:
+            threads.append(threading.Thread(target=nav_feed))
         for t in threads:
             t.start()
         for t in threads:
@@ -917,13 +1136,14 @@ def main() -> None:
 
         print("\n" + "=" * 72)
         ok = True
-        for tab in tabs:
+        for tab in sources:
             r = results.get(tab)
             if not r:
                 continue
             ok &= r.reached and not r.gaps
+            unit = "scrolls" if tab == "feed" else "weeks  "
             print(f"  {'OK ' if r.reached else '!! '}{tab:<7} "
-                  f"{r.weeks:>3} weeks  {r.items:>4} items  "
+                  f"{r.weeks:>3} {unit}  {r.items:>4} items  "
                   f"{r.newest} -> {r.oldest}  {len(r.gaps)} gap(s)")
             for g in r.gaps[:5]:
                 print(f"        gap: {g}")
@@ -945,6 +1165,9 @@ def main() -> None:
         target=walk_tab,
         args=(tab, gid, target, headless, store, pool, stats, wk, skip, mx))
         for tab, wk, skip, mx in jobs]
+    if use_feed:
+        threads.append(threading.Thread(
+            target=walk_feed, args=(target, headless, store, pool, stats)))
     for t in threads:
         t.start()
     for t in threads:
@@ -955,13 +1178,13 @@ def main() -> None:
         print(f"\n  Browsing done — finishing {left} download(s)...")
     pool.drain()
 
-    for tab in tabs:
+    for tab in sources:
         store.save_progress(tab)
     store.write_manifest()
 
     count, size = store.summary()
     print("\n" + "=" * 72)
-    for tab in tabs:
+    for tab in sources:
         print(f"  {tab:<7}: {stats.get(tab, 'saved'):>4} new  "
               f"{stats.get(tab, 'dups'):>4} dup  "
               f"{stats.get(tab, 'misses'):>3} miss  "
