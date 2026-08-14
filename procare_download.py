@@ -21,8 +21,8 @@ Three decoupled pieces, so nothing waits on anything it doesn't have to:
 Login happens once; the session is saved and reused. The password is never
 stored — only the session Procare itself issued.
 
-Output: flat files named  YYYYMMDD_<contenthash>.<ext>  so re-runs never
-duplicate, plus a CSV manifest.
+Output: flat files named  YYYYMMDD_<child>_<contenthash>.<ext>  so they sort by
+date, say who they are of, and never duplicate across runs. Plus a CSV manifest.
 """
 
 from __future__ import annotations
@@ -153,6 +153,13 @@ def date_in_url(url: str | None) -> dt.date | None:
 # --------------------------------------------------------------------------- #
 # Media items
 # --------------------------------------------------------------------------- #
+def child_slug(name: str) -> str:
+    """'Liana Bakman' -> 'liana'. Used as a filename segment, so keep it tame."""
+    first = (name or "").strip().split(" ")[0]
+    slug = re.sub(r"[^a-z0-9]", "", first.lower())
+    return slug[:16]
+
+
 @dataclass(frozen=True)
 class MediaItem:
     url: str                 # full-size, signed CDN URL
@@ -160,6 +167,7 @@ class MediaItem:
     when: dt.date
     tab: str
     week: str = ""
+    child: str = ""          # slug of the child this was fetched for
 
     @property
     def is_video(self) -> bool:
@@ -304,7 +312,9 @@ class Store:
     def _scan(self) -> None:
         """Index existing files and any per-source progress written before."""
         for name in os.listdir(self.dir):
-            m = re.match(r"\d{8}_([0-9a-f]{12})", name)
+            # Accept both the old YYYYMMDD_<hash> and the current
+            # YYYYMMDD_<child>_<hash> form, so existing files still de-duplicate.
+            m = re.match(r"\d{8}_(?:[a-z0-9]+_)?([0-9a-f]{12})", name)
             if m:
                 self._hashes.add(m.group(1))
                 continue
@@ -362,13 +372,19 @@ class Store:
         return ".mp4" if is_video else ".jpg"
 
     def save(self, data: bytes, item: MediaItem, content_type: str):
-        """Write named by content hash. Returns (filename, 'saved'|'dup')."""
+        """
+        Write named  YYYYMMDD_<child>_<contenthash>.<ext>.
+
+        A photo of both children is one file on Procare's side, so it is stored
+        once, under whichever child's walk reached it first.
+        """
         digest = hashlib.sha1(data).hexdigest()[:12]
         with self._lock:
             if digest in self._hashes:
                 return None, "dup"
             self._hashes.add(digest)
-        name = f"{item.when.strftime('%Y%m%d')}_{digest}" \
+        who = f"{item.child}_" if item.child else ""
+        name = f"{item.when.strftime('%Y%m%d')}_{who}{digest}" \
                f"{self._ext(item.url, content_type, item.is_video)}"
         path = os.path.join(self.dir, name)
         if os.path.exists(path):
@@ -806,7 +822,7 @@ class Feed(PayloadSource):
 
 def walk_feed(target: dt.date, headless: bool, store: Store | None,
               pool: DownloadPool | None, stats: Stats,
-              dry_run: bool = False) -> WalkResult:
+              dry_run: bool = False, child: str = "") -> WalkResult:
     """Scroll the activity feed back to the target date, queueing media."""
     who = "feed"
     res = WalkResult()
@@ -840,7 +856,7 @@ def walk_feed(target: dt.date, headless: bool, store: Store | None,
                 res.items += 1
                 if pool:
                     pool.submit(MediaItem(it.url, it.key, it.when, "feed",
-                                          it.when.isoformat()))
+                                          it.when.isoformat(), child))
                     queued += 1
                     stats.bump("feed", "fast")
 
@@ -945,6 +961,7 @@ def walk_api(kid_id: str, kid_name: str, api: Api, target: dt.date,
     directly, so no photo can be missed because a scroll didn't render it.
     """
     who = f"api:{kid_name[:6]}" if kid_name else "api"
+    slug = child_slug(kid_name)
     res = WalkResult()
     seen: set[str] = set()
     date_to = dt.date.today()
@@ -988,7 +1005,7 @@ def walk_api(kid_id: str, kid_name: str, api: Api, target: dt.date,
             res.items += 1
             if pool:
                 pool.submit(MediaItem(it.url, it.key, it.when, tab,
-                                      it.when.isoformat()))
+                                      it.when.isoformat(), slug))
                 queued += 1
                 stats.bump(tab, "fast")
 
@@ -1035,12 +1052,13 @@ def make_gallery(p, tab: str, gid: str, headless: bool):
 def walk_tab(tab: str, gid: str, target: dt.date, headless: bool,
              store: Store | None, pool: DownloadPool | None, stats: Stats,
              worker: int = 0, skip_weeks: int = 0, max_weeks: int = MAX_WEEKS,
-             dry_run: bool = False) -> WalkResult:
+             dry_run: bool = False, child: str = "") -> WalkResult:
     """
     Step back week by week. With a pool, queue every new item for download;
     without one (dry run / nav test), just count what's there.
     """
-    who = tab if worker == 0 else f"{tab[:3]}#{worker}"
+    who = f"{tab[:3]}:{child[:5]}" if child else (
+        tab if worker == 0 else f"{tab[:3]}#{worker}")
     res = WalkResult()
     cursor = dt.date.today()
     prev_start: dt.date | None = None
@@ -1074,7 +1092,7 @@ def walk_tab(tab: str, gid: str, target: dt.date, headless: bool,
             unique: dict[str, MediaItem] = {}
             for it in found:
                 unique.setdefault(it.key, MediaItem(it.url, it.key, it.when,
-                                                    tab, title or ""))
+                                                    tab, title or "", child))
             tiles = g.tiles()
 
             # Fallback: tiles the JSON didn't explain (rare) get the viewer path.
@@ -1098,7 +1116,8 @@ def walk_tab(tab: str, gid: str, target: dt.date, headless: bool,
                     stats.bump(tab, "clicked")
                     k = stable_key(href)
                     unique.setdefault(k, MediaItem(
-                        href, k, date_in_url(href) or when_fallback, tab, title or ""))
+                        href, k, date_in_url(href) or when_fallback, tab,
+                        title or "", child))
 
             queued = 0
             for it in unique.values():
@@ -1248,6 +1267,87 @@ def ensure_session(force_relogin: bool = False) -> Auth:
 # --------------------------------------------------------------------------- #
 # CLI
 # --------------------------------------------------------------------------- #
+def rename_with_children(store: Store, api: Api, kids: list, target: dt.date) -> None:
+    """
+    Add the child's name to files downloaded before naming included it.
+
+    Rebuilds a file-key -> child map from the API (no media is downloaded), then
+    uses the manifest's source URL to work out which child each existing file
+    belongs to. Files whose child can't be determined are left alone.
+    """
+    print("\n  Building a file -> child map from the API...")
+    key_child: dict[str, str] = {}
+    for kid in kids:
+        kid_id, slug = kid.get("id"), child_slug(kid.get("name") or "")
+        if not kid_id or not slug:
+            continue
+        page, empty = 1, 0
+        while page <= 500:
+            try:
+                rows = api.activities(kid_id, dt.date.today(), page)
+            except Exception:
+                break
+            if not rows:
+                empty += 1
+                if empty >= 2:
+                    break
+                page += 1
+                continue
+            empty = 0
+            items: list[MediaItem] = []
+            items_from_json(rows, "api", items, dt.date.today())
+            for it in items:
+                key_child.setdefault(it.key, slug)
+            oldest = min((item_date(r) for r in rows
+                          if isinstance(r, dict) and item_date(r)), default=None)
+            if oldest and oldest <= target:
+                break
+            page += 1
+        print(f"    {slug}: map now {len(key_child)} file(s)")
+
+    # Walk the manifest: source_url -> key -> child, then rename on disk.
+    renamed = skipped = missing = 0
+    rows_out = []
+    try:
+        with open(store.manifest) as fh:
+            lines = fh.read().splitlines()
+    except OSError:
+        print("  !! no manifest found; cannot map files to children")
+        return
+
+    header, body = lines[0], lines[1:]
+    for line in body:
+        parts = re.findall(r'"([^"]*)"', line)
+        if len(parts) < 4:
+            rows_out.append(line)
+            continue
+        name, date, week, url = parts[0], parts[1], parts[2], parts[3]
+        path = os.path.join(store.dir, name)
+        slug = key_child.get(stable_key(url), "")
+        m = re.match(r"(\d{8})_([0-9a-f]{12})(\.\w+)$", name)
+        if not slug or not m or not os.path.exists(path):
+            if not os.path.exists(path):
+                missing += 1
+            else:
+                skipped += 1
+            rows_out.append(line)
+            continue
+        new_name = f"{m.group(1)}_{slug}_{m.group(2)}{m.group(3)}"
+        try:
+            os.rename(path, os.path.join(store.dir, new_name))
+            renamed += 1
+            rows_out.append(f'"{new_name}","{date}","{week}","{url}"')
+        except OSError:
+            rows_out.append(line)
+
+    with open(store.manifest, "w") as fh:
+        fh.write(header + "\n" + "\n".join(rows_out) + "\n")
+
+    print(f"\n  renamed {renamed}, left alone {skipped} (child unknown), "
+          f"{missing} manifest row(s) had no file")
+    print(f"  manifest updated: {store.manifest}")
+
+
 def build_jobs(tabs: list[str], workers: int, target: dt.date) -> list[tuple]:
     """(tab, worker_no, skip_weeks, max_weeks) — photos split across workers."""
     total = max(1, ((dt.date.today() - target).days // 7) + 2)
@@ -1291,6 +1391,10 @@ def main() -> None:
     ap.add_argument("--kid", metavar="ID",
                     help="Limit to one child (id prefix). Default: all children "
                          "on the account.")
+    ap.add_argument("--rename-existing", action="store_true",
+                    help="Add the child's name to files downloaded before "
+                         "names were included. Renames in place using the "
+                         "manifest; downloads nothing.")
     ap.add_argument("--photos-only", action="store_true")
     ap.add_argument("--videos-only", action="store_true")
     ap.add_argument("--relogin", action="store_true",
@@ -1352,6 +1456,17 @@ def main() -> None:
 
     t0 = time.time()
 
+    # ------------------------- rename only ------------------------- #
+    if args.rename_existing:
+        if not api or not auth.kids:
+            print("!! renaming needs API access; try --relogin")
+            sys.exit(1)
+        rename_with_children(store, api, auth.kids, target)
+        count, size = store.summary()
+        print(f"\n  Folder now holds : {count} file(s), {human_size(size)}")
+        print(f"  FILES ARE IN     : {store.dir}")
+        return
+
     # ------------------------- nav test ------------------------- #
     if args.nav_test:
         print("\n  NAV TEST — walking the range, downloading nothing.\n")
@@ -1406,13 +1521,15 @@ def main() -> None:
 
     # The gallery URL is /dashboard/gallery/<kid_id>/..., so every child needs
     # its own walk — otherwise siblings' videos are silently never visited.
+    kid_names = {k["id"]: child_slug(k.get("name") or k.get("first_name") or "")
+                 for k in auth.kids if k.get("id")}
     threads = []
     for kid_id in (kid_ids or [gid]):
         for tab, wk, skip, mx in build_jobs(tabs, args.workers, target):
             threads.append(threading.Thread(
                 target=walk_tab,
                 args=(tab, kid_id, target, headless, store, pool, stats,
-                      wk, skip, mx)))
+                      wk, skip, mx, False, kid_names.get(kid_id, ""))))
     if use_feed:
         threads.append(threading.Thread(
             target=walk_feed, args=(target, headless, store, pool, stats)))

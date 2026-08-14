@@ -14,7 +14,8 @@ You log in yourself, in a real browser window. Nothing here bypasses authenticat
   Photos/Videos gallery — together they cover photos the gallery alone omits
 - Covers **every child on the account**, not just the first one
 - Grabs the **full-size original** of every item (not the gallery thumbnail)
-- Saves everything **flat** into a folder you choose as `YYYYMMDD_<contenthash>.jpg` / `.mp4`
+- Saves everything **flat** into a folder you choose as `YYYYMMDD_<child>_<contenthash>.jpg` / `.mp4`
+  — sorts by date, and each file says which child it is of
 - **Never duplicates**: filenames are a hash of the file's contents
 - **Resumable**: interrupt with Ctrl-C any time and re-run; it picks up where it stopped
 - **Logs in once**: the browser session is saved and reused on later runs
@@ -94,6 +95,30 @@ python procare_download.py --source feed      # activity feed only
 A photo appearing in both is downloaded once: sources share progress, so the
 second one skips it before fetching anything.
 
+### File names
+
+```
+20260813_liana_c523f65ce802.jpg
+        ^      ^
+        child  hash of the file's contents
+```
+
+The date is when the photo was taken (the activity's own timestamp), not when it
+was uploaded. The hash makes re-runs idempotent — the same photo always lands on
+the same name.
+
+A photo of two children is a single file on Procare's side, so it is stored once,
+under whichever child's walk reached it first.
+
+If you have files from an older version without the child segment:
+
+```bash
+python procare_download.py -o <folder> --rename-existing
+```
+
+That rebuilds the file-to-child map from the API and renames in place, updating
+the manifest. It downloads nothing.
+
 ### Choosing where files go
 
 By default everything lands in `./procare_media`. Point it anywhere with `-o`:
@@ -115,6 +140,7 @@ The folder is created if it doesn't exist, `~` is expanded, and the manifest and
 | `-d, --dl-threads M` | Parallel download threads (default 12) |
 | `--source all\|api\|gallery\|feed` | Where to look (default `all` = API + gallery) |
 | `--kid ID` | Limit to one child (id prefix); default is all children |
+| `--rename-existing` | Add child names to files downloaded before naming included them |
 | `--photos-only` / `--videos-only` | Restrict the gallery to one tab |
 | `--show` | Show the browser windows instead of running hidden |
 | `--relogin` | Ignore the saved session and log in again |
