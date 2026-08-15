@@ -9,6 +9,27 @@ is.
 
 ---
 
+## 0.6.0 — Modest defaults, and a shutdown that cannot hang
+
+Reported from a slower Mac: the run downloaded everything, then hung on a stuck
+thread and needed Ctrl-C, which surfaced as
+`Exception ignored while joining a thread in _thread._shutdown()`.
+
+**Defaults reduced** from 2 browsers / 12 download threads to **1 / 4**. The old
+values were tuned on the machine this was written on. Anyone with RAM to spare
+can still pass `-w 3 -d 12`.
+
+**Shutdown no longer waits forever.** Three separate causes:
+
+- The pool waited on `queue.join()`, which blocks indefinitely if a single task
+  is ever lost. It now tracks its own counter and gives up after 5 minutes with
+  no progress.
+- Download workers blocked in `get()` with no way to be told to stop. They now
+  poll with a timeout and honour a shared `SHUTDOWN` event.
+- Browser threads were non-daemon and joined without a timeout, so one wedged
+  browser held the whole process open — exactly what produced that traceback.
+  They are daemons now, joined with a cap, and Ctrl-C exits immediately.
+
 ## 0.5.0 — File dates
 
 **Files carry the day the photo was taken.** Created and modified dates are set

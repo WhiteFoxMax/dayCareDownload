@@ -63,6 +63,7 @@ WEEK_TIMEOUT = 20.0        # hard cap waiting for a week to load
 PAYLOAD_GRACE = 0.35       # settle time after the week's JSON arrives
 VIEWER_TIMEOUT = 12.0      # fallback path: waiting for the viewer's link
 TILE_RETRIES = 3
+WALKER_JOIN_TIMEOUT = 1800.0   # hard cap on waiting for browser threads
 
 # Procare DOM selectors — the things most likely to break on a redesign.
 SEL_DROPDOWN = "div.date-filter .dropdown-portal__header"     # Daily/Weekly picker
@@ -91,6 +92,10 @@ UA = ("Mozilla/5.0 (Macintosh; Intel Mac OS X 10_15_7) AppleWebKit/537.36 "
       "(KHTML, like Gecko) Chrome/120 Safari/537.36")
 
 PRINT_LOCK = threading.Lock()
+
+# Set on Ctrl-C (or when a stage gives up) so every loop can bail out promptly
+# instead of the process hanging on a thread that will never finish.
+SHUTDOWN = threading.Event()
 
 
 def log(who: str, msg: str) -> None:
@@ -481,28 +486,70 @@ class Store:
 # Download pool
 # --------------------------------------------------------------------------- #
 class DownloadPool:
-    """Fetches signed CDN URLs over plain HTTP — no browser involved."""
+    """
+    Fetches signed CDN URLs over plain HTTP — no browser involved.
+
+    Shutdown is deliberately defensive: a download pool that can hang on exit
+    is worse than one that occasionally gives up. Nothing here waits forever.
+    """
+
+    STALL_LIMIT = 300.0        # give up waiting if no item completes for this long
 
     def __init__(self, store: Store, stats: Stats, threads: int):
         self.store, self.stats = store, stats
         self.q: queue.Queue = queue.Queue()
+        self._lock = threading.Lock()
+        self._pending = 0      # our own counter; q.join() can deadlock silently
         self.threads = [threading.Thread(target=self._worker, args=(i + 1,),
-                                         daemon=True) for i in range(threads)]
+                                         daemon=True, name=f"dl{i + 1}")
+                        for i in range(threads)]
 
     def start(self) -> None:
         for t in self.threads:
             t.start()
 
     def submit(self, item: MediaItem) -> None:
+        with self._lock:
+            self._pending += 1
         self.q.put(item)
 
     def pending(self) -> int:
-        return self.q.qsize()
+        with self._lock:
+            return self._pending
+
+    def _done_one(self) -> None:
+        with self._lock:
+            self._pending = max(0, self._pending - 1)
 
     def drain(self) -> None:
-        self.q.join()
+        """
+        Wait for outstanding downloads, then stop the workers.
+
+        Bounded on purpose: it watches for progress rather than blocking on
+        queue.join(), so a lost task or a wedged socket can't hang the process
+        forever the way it used to.
+        """
+        last, stalled = self.pending(), 0.0
+        while self.pending() > 0 and not SHUTDOWN.is_set():
+            time.sleep(0.5)
+            now = self.pending()
+            if now == last:
+                stalled += 0.5
+                if stalled >= self.STALL_LIMIT:
+                    log("pool", f"giving up waiting on {now} download(s) "
+                                f"after {self.STALL_LIMIT:.0f}s with no progress")
+                    break
+            else:
+                stalled, last = 0.0, now
+
         for _ in self.threads:
             self.q.put(None)
+        for t in self.threads:
+            t.join(timeout=10)
+        alive = [t.name for t in self.threads if t.is_alive()]
+        if alive:
+            log("pool", f"{len(alive)} download thread(s) still busy; "
+                        f"they are daemons and will not block exit")
 
     @staticmethod
     def _session() -> requests.Session:
@@ -514,8 +561,11 @@ class DownloadPool:
 
     def _worker(self, idx: int) -> None:
         session = self._session()
-        while True:
-            item = self.q.get()
+        while not SHUTDOWN.is_set():
+            try:
+                item = self.q.get(timeout=1.0)   # timeout so SHUTDOWN is noticed
+            except queue.Empty:
+                continue
             if item is None:
                 self.q.task_done()
                 return
@@ -548,6 +598,7 @@ class DownloadPool:
                 else:
                     self.stats.bump(item.tab, "dups")
             finally:
+                self._done_one()
                 self.q.task_done()
 
 
@@ -892,6 +943,8 @@ def walk_feed(target: dt.date, headless: bool, store: Store | None,
         feed.open()
 
         for round_no in range(MAX_FEED_SCROLLS):
+            if SHUTDOWN.is_set():
+                break
             oldest = feed.oldest_date()
             if oldest:
                 res.oldest = oldest
@@ -1023,7 +1076,7 @@ def walk_api(kid_id: str, kid_name: str, api: Api, target: dt.date,
     page = 1
     empty_pages = 0
 
-    while page <= 500:
+    while page <= 500 and not SHUTDOWN.is_set():
         try:
             rows = api.activities(kid_id, date_to, page)
         except Exception as exc:
@@ -1132,6 +1185,8 @@ def walk_tab(tab: str, gid: str, target: dt.date, headless: bool,
         g.take_payloads()   # discard anything gathered while skipping
 
         for _ in range(max_weeks):
+            if SHUTDOWN.is_set():
+                break
             title = g.title()
             week_start = parse_week_start(title, cursor)
             if week_start:
@@ -1567,10 +1622,12 @@ def main() -> None:
                     help="Ignore the saved session and log in again.")
     ap.add_argument("--show", action="store_true",
                     help="Show the browser windows (default: hidden).")
-    ap.add_argument("-w", "--workers", type=int, default=2, metavar="N",
-                    help="Browsers splitting the photo date range (default 2).")
-    ap.add_argument("-d", "--dl-threads", type=int, default=12, metavar="M",
-                    help="Parallel download threads (default 12).")
+    ap.add_argument("-w", "--workers", type=int, default=1, metavar="N",
+                    help="Browsers splitting the photo date range (default 1). "
+                         "Each is a full Chromium; raise only on a machine with "
+                         "RAM to spare.")
+    ap.add_argument("-d", "--dl-threads", type=int, default=4, metavar="M",
+                    help="Parallel download threads (default 4).")
     args = ap.parse_args()
 
     target = (dt.date.fromisoformat(args.target_date)
@@ -1709,24 +1766,36 @@ def main() -> None:
     for kid_id in (kid_ids or [gid]):
         for tab, wk, skip, mx in build_jobs(tabs, args.workers, target):
             threads.append(threading.Thread(
-                target=walk_tab,
+                target=walk_tab, daemon=True, name=f"{tab}-{kid_id[:6]}",
                 args=(tab, kid_id, target, headless, store, pool, stats,
                       wk, skip, mx, False, kid_names.get(kid_id, ""))))
     if use_feed:
         threads.append(threading.Thread(
-            target=walk_feed, args=(target, headless, store, pool, stats)))
+            target=walk_feed, daemon=True, name="feed",
+            args=(target, headless, store, pool, stats)))
     if use_api and api:
         for kid in (auth.kids or [{"id": k, "name": ""} for k in kid_ids]):
             if kid.get("id") not in kid_ids:
                 continue
             threads.append(threading.Thread(
-                target=walk_api,
+                target=walk_api, daemon=True,
+                name=f"api-{(kid.get('name') or '?')[:8]}",
                 args=(kid["id"], kid.get("name") or kid.get("first_name") or "",
                       api, target, store, pool, stats)))
     for t in threads:
         t.start()
+
+    # Bounded join: a wedged browser must not hold the whole process open.
+    # The threads are daemons, so anything still running at the end is dropped
+    # rather than blocking exit — everything downloaded is already on disk.
+    deadline = time.time() + WALKER_JOIN_TIMEOUT
     for t in threads:
-        t.join()
+        t.join(timeout=max(5.0, deadline - time.time()))
+    stuck = [t.name for t in threads if t.is_alive()]
+    if stuck:
+        log("main", f"giving up on {len(stuck)} browser thread(s) that did not "
+                    f"finish: {', '.join(stuck[:4])}")
+        SHUTDOWN.set()
 
     left = pool.pending()
     if left:

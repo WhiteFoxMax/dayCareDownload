@@ -76,6 +76,27 @@ Confirm it prints `REACHED TARGET` and `0 gaps` before committing to a long run.
 
 ### 2. Download everything
 
+**Safe defaults — start here.** 1 browser, 4 download threads. Comfortable on a
+base-model laptop (8 GB RAM), and the whole run is still a few minutes:
+
+```bash
+python procare_download.py
+```
+
+**Faster, if you have the machine for it.** 3 browsers and 12 download threads.
+This was the old default, and is what made a slower Mac hang on a stuck thread —
+only reach for it with 16 GB+ and a solid connection:
+
+```bash
+python procare_download.py -w 3 -d 12
+```
+
+Each `-w` worker is a full Chromium instance, so that flag costs real RAM; `-d`
+is just sockets and is much cheaper to raise. If a run feels unstable, drop `-w`
+back to 1 first.
+
+To go further back than the default target:
+
 ```bash
 python procare_download.py --target-date 2025-07-01
 ```
@@ -159,8 +180,8 @@ The folder is created if it doesn't exist, `~` is expanded, and the manifest and
 | `-o, --out DIR` | Download folder (default `./procare_media`) |
 | `--target-date YYYY-MM-DD` | How far back to go (default `2025-08-18`) |
 | `--nav-test` | Verify the date range is reachable; download nothing |
-| `-w, --workers N` | Browsers splitting the photo date range (default 2) |
-| `-d, --dl-threads M` | Parallel download threads (default 12) |
+| `-w, --workers N` | Browsers splitting the photo date range (default 1) |
+| `-d, --dl-threads M` | Parallel download threads (default 4) |
 | `--source all\|api\|gallery\|feed` | Where to look (default `all` = API + gallery) |
 | `--kid ID` | Limit to one child (id prefix); default is all children |
 | `--rename-existing` | Add child names to older downloads, then file them into folders |
@@ -170,7 +191,15 @@ The folder is created if it doesn't exist, `~` is expanded, and the manifest and
 | `--show` | Show the browser windows instead of running hidden |
 | `--relogin` | Ignore the saved session and log in again |
 
-The defaults are tuned for a normal laptop. More workers means more browsers, so more RAM and CPU; past ~4 you're mostly adding load, not speed.
+The defaults are deliberately modest so the script behaves on a modest machine.
+More workers means more browsers, so more RAM and CPU; past ~4 you are mostly
+adding load, not speed.
+
+Interrupting with Ctrl-C is safe at any point — progress is written as it goes,
+and re-running resumes. Nothing in the shutdown path blocks: the download pool
+stops waiting if it makes no progress for 5 minutes, browser threads are daemons
+joined with a timeout, and Ctrl-C exits immediately rather than hanging in
+`_thread._shutdown()`.
 
 ---
 
